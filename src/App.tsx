@@ -27,6 +27,15 @@ import { SceneStateSerializer } from './sceneState'
 const SPLAT_URL = '/room.splat'
 const MODEL_URL = '/GearboxAssy.glb'
 
+// The splat loader needs a Content-Length header, which hosts drop when they compress or stream big files.
+// Download the file ourselves and give the loader an in-memory blob URL instead (also reused for the density pass).
+const splatBlobUrl = fetch(SPLAT_URL)
+  .then((res) => {
+    if (!res.ok) throw new Error(`Could not load ${SPLAT_URL}: ${res.status}`)
+    return res.blob()
+  })
+  .then((blob) => URL.createObjectURL(blob))
+
 // Default preset. Paste a copied preset's values here to make it permanent.
 const PRESET = {
   splat: { offsetX: 0, floorHeight: 7.1, offsetZ: 0, scale: 2.16, rotX: 332, rotY: 7, rotZ: 4 },
@@ -187,15 +196,18 @@ function Scene() {
   // depth sync: the mesh is opaque and writes depth, the splat tests depth but doesn't write it,
   // so splats in front of the mesh draw over it and splats behind it are rejected
   const splatGroup = useRef<Group>(null)
-  useEffect(() => {
+  const splatConfigured = useRef(false)
+  useFrame(() => {
+    if (splatConfigured.current) return
     splatGroup.current?.traverse((o) => {
       const mat = (o as Mesh).material as ShaderMaterial | undefined
       if (!mat) return
       mat.transparent = true
       mat.depthTest = true
       mat.depthWrite = false
+      splatConfigured.current = true
     })
-  }, [])
+  })
 
   // shadows
   useEffect(() => {
@@ -259,8 +271,13 @@ function Scene() {
     geometry.setAttribute('color', new BufferAttribute(colors, 3))
     return { positions, colors, geometry }
   }, [])
+  const [splatUrl, setSplatUrl] = useState<string>()
   useEffect(() => {
-    loadDensePoints(SPLAT_URL).then((p) => {
+    splatBlobUrl.then(setSplatUrl)
+  }, [])
+  useEffect(() => {
+    if (!splatUrl) return
+    loadDensePoints(splatUrl).then((p) => {
       dense.current = p
       setDensePts(p)
       const field = buildDistanceField(p)
@@ -268,7 +285,7 @@ function Scene() {
       uniforms.uFieldMin.value.copy(field.min)
       uniforms.uFieldSize.value.copy(field.size)
     })
-  }, [])
+  }, [splatUrl])
   const tmp = useMemo(() => {
     // splat alignment never changes, build its matrix once
     const splatMatrix = new Matrix4().compose(
@@ -387,12 +404,16 @@ function Scene() {
         )}
       </group>
       <group ref={splatGroup}>
-        <Splat
-          src={SPLAT_URL}
-          position={[splat.offsetX, splat.floorHeight, splat.offsetZ]}
-          scale={splat.scale}
-          rotation={[rad(splat.rotX), rad(splat.rotY), rad(splat.rotZ)]}
-        />
+        {splatUrl && (
+          <Suspense fallback={null}>
+            <Splat
+              src={splatUrl}
+              position={[splat.offsetX, splat.floorHeight, splat.offsetZ]}
+              scale={splat.scale}
+              rotation={[rad(splat.rotX), rad(splat.rotY), rad(splat.rotZ)]}
+            />
+          </Suspense>
+        )}
       </group>
       {prox.showDense && densePts && (
         <group
