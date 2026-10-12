@@ -22,19 +22,42 @@ import { button, useControls } from 'leva'
 import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib'
 import { buildDistanceField, emptyField, loadDensePoints, nearest } from './proximity'
 import { SceneStateSerializer } from './sceneState'
+import { setLoading, useLoading } from './loading'
 
 // Put your files in /public
 const SPLAT_URL = '/room.splat'
 const MODEL_URL = '/GearboxAssy.glb'
 
 // The splat loader needs a Content-Length header, which hosts drop when they compress or stream big files.
-// Download the file ourselves and give the loader an in-memory blob URL instead (also reused for the density pass).
-const splatBlobUrl = fetch(SPLAT_URL)
-  .then((res) => {
-    if (!res.ok) throw new Error(`Could not load ${SPLAT_URL}: ${res.status}`)
-    return res.blob()
-  })
-  .then((blob) => URL.createObjectURL(blob))
+// Download the file ourselves (this also gives us progress) and hand the loader an in-memory blob URL,
+// which the density pass reuses too.
+async function downloadSplat() {
+  try {
+    const res = await fetch(SPLAT_URL)
+    if (!res.ok || !res.body) throw new Error(`Could not load ${SPLAT_URL}: ${res.status}`)
+    const total = Number(res.headers.get('Content-Length')) || 0
+    const reader = res.body.getReader()
+    const chunks: Uint8Array[] = []
+    let loaded = 0
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      loaded += value.length
+      setLoading({
+        label: `Downloading splat (${(loaded / 1e6).toFixed(0)} MB)`,
+        progress: total ? Math.min(1, loaded / total) : null,
+      })
+    }
+    setLoading({ downloading: false, progress: null })
+    return URL.createObjectURL(new Blob(chunks as BlobPart[]))
+  } catch (e) {
+    console.error(e)
+    setLoading({ label: 'Could not load the splat', failed: true })
+    throw e
+  }
+}
+const splatBlobUrl = downloadSplat()
 
 // Default preset. Paste a copied preset's values here to make it permanent.
 const PRESET = {
@@ -277,13 +300,15 @@ function Scene() {
   }, [])
   useEffect(() => {
     if (!splatUrl) return
-    loadDensePoints(splatUrl).then((p) => {
+    // let the label paint before the heavy synchronous work
+    new Promise((r) => setTimeout(r, 50)).then(() => loadDensePoints(splatUrl)).then((p) => {
       dense.current = p
       setDensePts(p)
       const field = buildDistanceField(p)
       uniforms.uField.value = field.texture
       uniforms.uFieldMin.value.copy(field.min)
       uniforms.uFieldSize.value.copy(field.size)
+      setLoading({ fieldReady: true })
     })
   }, [splatUrl])
   const tmp = useMemo(() => {
@@ -412,6 +437,7 @@ function Scene() {
               scale={splat.scale}
               rotation={[rad(splat.rotX), rad(splat.rotY), rad(splat.rotZ)]}
             />
+            <SplatReady />
           </Suspense>
         )}
       </group>
@@ -463,6 +489,33 @@ function Scene() {
   )
 }
 
+// rendered after the splat, so it only mounts once the splat has finished loading
+function SplatReady() {
+  useEffect(() => setLoading({ splatReady: true }), [])
+  return null
+}
+
+function Loader() {
+  const { label, downloading, progress, splatReady, fieldReady, failed } = useLoading()
+  const done = splatReady && fieldReady
+  const text = failed || downloading ? label : fieldReady ? 'Preparing splat' : 'Building proximity field'
+  return (
+    <div
+      className={`absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-black/70 text-white transition-opacity duration-500 ${
+        done ? 'pointer-events-none opacity-0' : ''
+      }`}
+    >
+      <div className={`text-sm ${failed ? 'text-red-400' : ''}`}>{text}</div>
+      <div className="h-1 w-56 overflow-hidden rounded bg-white/20">
+        <div
+          className={`h-full bg-white ${progress === null ? 'w-1/3 animate-pulse' : ''}`}
+          style={progress === null ? undefined : { width: `${progress * 100}%` }}
+        />
+      </div>
+    </div>
+  )
+}
+
 function CameraFov({ fov }: { fov: number }) {
   const camera = useThree((s) => s.camera)
   if ('fov' in camera) {
@@ -474,7 +527,8 @@ function CameraFov({ fov }: { fov: number }) {
 
 export default function App() {
   return (
-    <div className="h-full w-full bg-black">
+    <div className="relative h-full w-full bg-black">
+      <Loader />
       <div id="distance" className="absolute left-3 top-3 z-10 font-mono text-sm text-white" />
       <Canvas shadows camera={{ position: PRESET.camera.position as [number, number, number], fov: PRESET.camera.fov }}>
         <Suspense fallback={null}>
